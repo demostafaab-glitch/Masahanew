@@ -45,7 +45,7 @@ class MainActivity : Activity() {
         status = TextView(this).apply {
             textSize = 14f
             setPadding(16, 8, 16, 8)
-            text = "افتح ملف DXF للبدء"
+            text = "DXF Survey v${BuildConfig.VERSION_NAME} — تصميم المهندس مصطفى عبدو"
         }
         dxfView.onSelectionChanged = { e ->
             status.text = if (e != null) "محدد: ${e.type}" else "لا يوجد تحديد"
@@ -84,11 +84,11 @@ class MainActivity : Activity() {
         }
 
         // Survey point rows
-        stakeStation = PointRow("محطة")
-        stakeZero = PointRow("تصفير")
-        stakeTarget = PointRow("هدف")
-        detailStation = PointRow("محطة")
-        detailZero = PointRow("تصفير")
+        stakeStation = PointRow("محطة", Role.STATION)
+        stakeZero = PointRow("تصفير", Role.ZERO)
+        stakeTarget = PointRow("هدف", Role.TARGET)
+        detailStation = PointRow("محطة", Role.STATION)
+        detailZero = PointRow("تصفير", Role.ZERO)
         angleField = numField("الزاوية الأفقية (غ)", null)
         distField = numField("المسافة (م)", null)
 
@@ -173,6 +173,7 @@ class MainActivity : Activity() {
     private fun pickFor(row: PointRow) {
         dxfView.startPick { x, y ->
             row.fill(Survey.Pt(x, y))
+            dxfView.setMarker(row.role, x, y)
             status.text = "تم الالتقاط: E=${f4(x)}  N=${f4(y)}"
         }
         status.text = "اضغط على الشاشة لالتقاط نقطة (${snapLabel(dxfView.snapMode)})"
@@ -349,7 +350,7 @@ class MainActivity : Activity() {
     }
 
     /** One point: East and North fields, plus a button to pick it from the drawing. */
-    private inner class PointRow(label: String) {
+    private inner class PointRow(label: String, val role: Role) {
         private val east = numField("$label E", null)
         private val north = numField("$label N", null)
 
