@@ -22,9 +22,12 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon
+        run: >-
+          gradle :app:assembleDebug --no-daemon
+          -PversionCode=${{ github.run_number }}
+          -PversionName=1.0.${{ github.run_number }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
+          name: DXF-Survey-1.0.${{ github.run_number }}
           path: app/build/outputs/apk/debug/*.apk
