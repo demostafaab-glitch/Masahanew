@@ -8,30 +8,49 @@ import android.graphics.Path
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import java.util.IdentityHashMap
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 
+/** Which part of an entity a pick may snap to. */
+enum class SnapMode { START, MIDDLE, END, POINT }
+
+/**
+ * Draws every entity. Pinch to zoom, one finger to pan.
+ * Tap an entity to select it, then drag it to move it.
+ * In pick mode a tap selects the nearest point of the chosen snap type.
+ */
 class DxfView(context: Context) : View(context) {
+
     var model: DxfModel? = null
         set(value) {
             field = value
             selected = null
-            needFit = true
+            refreshAll()
             fitToContent()
             invalidate()
         }
 
     var selected: DxfEntity? = null
         private set
+
+    var snapMode: SnapMode = SnapMode.END
+
     var onSelectionChanged: ((DxfEntity?) -> Unit)? = null
     var onModelChanged: (() -> Unit)? = null
+    var onPickMiss: (() -> Unit)? = null
 
+    private var pickCallback: ((Double, Double) -> Unit)? = null
+    private var hoverSnap: DoubleArray? = null
+
+    // World to screen: sx = x * scale + offsetX, sy = offsetY - y * scale
     private var scale = 1f
     private var offsetX = 0f
     private var offsetY = 0f
     private var needFit = true
+
     private var moved = false
     private var snapshotTaken = false
     private var downX = 0f
@@ -39,8 +58,12 @@ class DxfView(context: Context) : View(context) {
     private var lastX = 0f
     private var lastY = 0f
     private var dragEntity: DxfEntity? = null
+
     private val touchSlop = 12f
     private val hitRadius = 36f
+
+    /** Primitives of each entity in world coordinates, rebuilt when entities change. */
+    private val cache = IdentityHashMap<DxfEntity, List<Prim>>()
 
     private val wirePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK; strokeWidth = 2f; style = Paint.Style.STROKE
@@ -52,7 +75,10 @@ class DxfView(context: Context) : View(context) {
         color = Color.BLUE; style = Paint.Style.FILL
     }
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.DKGRAY; textSize = 28f
+        color = Color.DKGRAY
+    }
+    private val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0, 150, 60); strokeWidth = 3f; style = Paint.Style.STROKE
     }
     private val path = Path()
 
@@ -66,13 +92,44 @@ class DxfView(context: Context) : View(context) {
         }
     )
 
+    val isPicking: Boolean
+        get() = pickCallback != null
+
     fun select(e: DxfEntity?) {
         selected = e
         onSelectionChanged?.invoke(e)
         invalidate()
     }
 
-    fun zoomBy(factor: Float) { zoomAt(factor, width / 2f, height / 2f) }
+    /** Next tap on a snap point calls [callback] with its world coordinates. */
+    fun startPick(callback: (Double, Double) -> Unit) {
+        pickCallback = callback
+        hoverSnap = null
+        invalidate()
+    }
+
+    fun cancelPick() {
+        pickCallback = null
+        hoverSnap = null
+        invalidate()
+    }
+
+    fun zoomBy(factor: Float) {
+        zoomAt(factor, width / 2f, height / 2f)
+    }
+
+    fun refreshAll() {
+        cache.clear()
+        val m = model ?: return
+        for (e in m.entities) cache[e] = Geometry.primitives(e, m.blocks)
+        invalidate()
+    }
+
+    fun refreshEntity(e: DxfEntity) {
+        val m = model ?: return
+        cache[e] = Geometry.primitives(e, m.blocks)
+        invalidate()
+    }
 
     private fun zoomAt(factor: Float, fx: Float, fy: Float) {
         val wx = (fx - offsetX) / scale
@@ -84,8 +141,11 @@ class DxfView(context: Context) : View(context) {
     }
 
     fun fitToContent() {
-        if (width == 0 || height == 0) { needFit = true; return }
-        val b = model?.bounds()
+        if (width == 0 || height == 0) {
+            needFit = true
+            return
+        }
+        val b = worldBounds()
         if (b == null) {
             scale = 1f
             offsetX = width / 2f
@@ -105,6 +165,26 @@ class DxfView(context: Context) : View(context) {
         invalidate()
     }
 
+    private fun worldBounds(): DoubleArray? {
+        val b = doubleArrayOf(Double.MAX_VALUE, Double.MAX_VALUE, -Double.MAX_VALUE, -Double.MAX_VALUE)
+        fun inc(x: Double, y: Double) {
+            b[0] = min(b[0], x)
+            b[1] = min(b[1], y)
+            b[2] = max(b[2], x)
+            b[3] = max(b[3], y)
+        }
+        for (list in cache.values) {
+            for (p in list) {
+                when (p) {
+                    is Prim.Poly -> for (v in p.pts) inc(v[0], v[1])
+                    is Prim.Dot -> inc(p.x, p.y)
+                    is Prim.Label -> inc(p.x, p.y)
+                }
+            }
+        }
+        return if (b[0] > b[2]) null else b
+    }
+
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         super.onSizeChanged(w, h, ow, oh)
         if (needFit) fitToContent()
@@ -119,32 +199,30 @@ class DxfView(context: Context) : View(context) {
         val m = model ?: return
         for (e in m.entities) {
             val paint = if (e === selected) selectPaint else wirePaint
-            when (e.type) {
-                "POINT" -> e.vertices().firstOrNull()?.let {
-                    canvas.drawCircle(sx(it[0]), sy(it[1]), 5f, pointPaint)
-                }
-                "TEXT" -> e.vertices().firstOrNull()?.let {
-                    canvas.drawText(e.getStr(1) ?: "", sx(it[0]), sy(it[1]), textPaint)
-                }
-                "LINE" -> {
-                    val v = e.vertices()
-                    if (v.size == 2) canvas.drawLine(sx(v[0][0]), sy(v[0][1]), sx(v[1][0]), sy(v[1][1]), paint)
-                }
-                "CIRCLE" -> {
-                    val c = e.vertices().firstOrNull()
-                    val r = e.getNum(40)
-                    if (c != null && r != null) canvas.drawCircle(sx(c[0]), sy(c[1]), (r * scale).toFloat(), paint)
-                }
-                "LWPOLYLINE" -> {
-                    val v = e.vertices()
-                    if (v.size >= 2) {
+            val prims = cache[e] ?: continue
+            for (p in prims) {
+                when (p) {
+                    is Prim.Poly -> {
                         path.reset()
-                        path.moveTo(sx(v[0][0]), sy(v[0][1]))
-                        for (k in 1 until v.size) path.lineTo(sx(v[k][0]), sy(v[k][1]))
+                        p.pts.forEachIndexed { i, v ->
+                            if (i == 0) path.moveTo(sx(v[0]), sy(v[1]))
+                            else path.lineTo(sx(v[0]), sy(v[1]))
+                        }
+                        if (p.closed) path.close()
                         canvas.drawPath(path, paint)
+                    }
+                    is Prim.Dot -> canvas.drawCircle(sx(p.x), sy(p.y), 5f, pointPaint)
+                    is Prim.Label -> {
+                        textPaint.textSize = (p.height * scale).toFloat().coerceIn(8f, 300f)
+                        canvas.drawText(p.text, sx(p.x), sy(p.y), textPaint)
                     }
                 }
             }
+        }
+        hoverSnap?.let { h ->
+            val x = sx(h[0])
+            val y = sy(h[1])
+            canvas.drawRect(x - 12f, y - 12f, x + 12f, y + 12f, markerPaint)
         }
     }
 
@@ -153,41 +231,73 @@ class DxfView(context: Context) : View(context) {
         if (scaleDetector.isInProgress) {
             dragEntity = null
             moved = true
+            hoverSnap = null
+            invalidate()
             return true
         }
+        val picking = isPicking
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                downX = event.x; downY = event.y
-                lastX = event.x; lastY = event.y
+                downX = event.x
+                downY = event.y
+                lastX = event.x
+                lastY = event.y
                 moved = false
                 snapshotTaken = false
                 val s = selected
-                dragEntity = if (s != null && hitDistance(s, event.x, event.y) <= hitRadius) s else null
+                dragEntity = if (!picking && s != null && hitDistance(s, event.x, event.y) <= hitRadius) s else null
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.x - lastX
                 val dy = event.y - lastY
-                lastX = event.x; lastY = event.y
-                if (!moved && hypot((event.x - downX).toDouble(), (event.y - downY).toDouble()) > touchSlop) moved = true
-                if (!moved) return true
+                lastX = event.x
+                lastY = event.y
+                if (!moved && hypot((event.x - downX).toDouble(), (event.y - downY).toDouble()) > touchSlop) {
+                    moved = true
+                }
+                if (!moved) {
+                    if (picking) {
+                        hoverSnap = snapAt(event.x, event.y)
+                        invalidate()
+                    }
+                    return true
+                }
+                hoverSnap = null
                 val de = dragEntity
                 if (de != null) {
                     if (!snapshotTaken) {
                         model?.snapshot()
                         snapshotTaken = true
                     }
-                    de.move(dx / scale.toDouble(), -dy / scale.toDouble())
+                    de.move((dx / scale).toDouble(), (-dy / scale).toDouble())
+                    refreshEntity(de)
                     onModelChanged?.invoke()
                 } else {
-                    offsetX += dx; offsetY += dy
+                    offsetX += dx
+                    offsetY += dy
                 }
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
                 if (!moved) {
-                    val m = model
-                    select(if (m != null) nearest(m, event.x, event.y) else null)
+                    val cb = pickCallback
+                    if (cb != null) {
+                        val c = snapAt(event.x, event.y)
+                        if (c != null) {
+                            pickCallback = null
+                            hoverSnap = null
+                            invalidate()
+                            cb(c[0], c[1])
+                        } else {
+                            onPickMiss?.invoke()
+                        }
+                    } else {
+                        val m = model
+                        select(if (m != null) nearest(m, event.x, event.y) else null)
+                    }
                 }
+                hoverSnap = null
+                invalidate()
             }
         }
         return true
@@ -198,29 +308,79 @@ class DxfView(context: Context) : View(context) {
         var bestD = hitRadius
         for (e in m.entities) {
             val d = hitDistance(e, x, y)
-            if (d <= bestD) { bestD = d; best = e }
+            if (d <= bestD) {
+                bestD = d
+                best = e
+            }
         }
         return best
     }
 
+    /** Screen distance from a touch point to the nearest piece of the entity. */
     private fun hitDistance(e: DxfEntity, x: Float, y: Float): Float {
-        val v = e.vertices()
-        if (v.isEmpty()) return Float.MAX_VALUE
-        return when (e.type) {
-            "CIRCLE" -> {
-                val r = ((e.getNum(40) ?: 0.0) * scale).toFloat()
-                abs(dist(x, y, sx(v[0][0]), sy(v[0][1])) - r)
+        var best = Float.MAX_VALUE
+        for (p in cache[e] ?: emptyList()) {
+            val d = when (p) {
+                is Prim.Poly -> polyDist(p, x, y)
+                is Prim.Dot -> dist(x, y, sx(p.x), sy(p.y))
+                is Prim.Label -> dist(x, y, sx(p.x), sy(p.y))
             }
-            "LINE", "LWPOLYLINE" -> {
-                if (v.size == 1) return dist(x, y, sx(v[0][0]), sy(v[0][1]))
-                var best = Float.MAX_VALUE
-                for (k in 0 until v.size - 1) {
-                    best = min(best, segDist(x, y, sx(v[k][0]), sy(v[k][1]), sx(v[k + 1][0]), sy(v[k + 1][1])))
-                }
-                best
-            }
-            else -> dist(x, y, sx(v[0][0]), sy(v[0][1]))
+            if (d < best) best = d
         }
+        return best
+    }
+
+    private fun polyDist(p: Prim.Poly, x: Float, y: Float): Float {
+        var best = Float.MAX_VALUE
+        val n = p.pts.size
+        val segs = if (p.closed) n else n - 1
+        for (i in 0 until segs) {
+            val a = p.pts[i]
+            val b = p.pts[(i + 1) % n]
+            best = min(best, segDist(x, y, sx(a[0]), sy(a[1]), sx(b[0]), sy(b[1])))
+        }
+        return best
+    }
+
+    /** Nearest snap point of the current [snapMode] within the touch radius, in world coordinates. */
+    private fun snapAt(x: Float, y: Float): DoubleArray? {
+        var best: DoubleArray? = null
+        var bestD = hitRadius
+        for (list in cache.values) {
+            for (p in list) {
+                for (c in candidates(p)) {
+                    val d = dist(x, y, sx(c[0]), sy(c[1]))
+                    if (d <= bestD) {
+                        bestD = d
+                        best = c
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    private fun candidates(p: Prim): List<DoubleArray> = when (p) {
+        is Prim.Poly -> when (snapMode) {
+            SnapMode.START -> listOf(p.pts.first())
+            SnapMode.END -> listOf(p.pts.last())
+            SnapMode.MIDDLE -> midpoints(p)
+            SnapMode.POINT -> listOfNotNull(p.center)
+        }
+        is Prim.Dot -> if (snapMode == SnapMode.POINT) listOf(doubleArrayOf(p.x, p.y)) else emptyList()
+        is Prim.Label -> if (snapMode == SnapMode.POINT) listOf(doubleArrayOf(p.x, p.y)) else emptyList()
+    }
+
+    private fun midpoints(p: Prim.Poly): List<DoubleArray> {
+        val out = mutableListOf<DoubleArray>()
+        val n = p.pts.size
+        val segs = if (p.closed) n else n - 1
+        for (i in 0 until segs) {
+            val a = p.pts[i]
+            val b = p.pts[(i + 1) % n]
+            out.add(doubleArrayOf((a[0] + b[0]) / 2, (a[1] + b[1]) / 2))
+        }
+        return out
     }
 
     private fun dist(ax: Float, ay: Float, bx: Float, by: Float): Float =
