@@ -251,7 +251,7 @@ object Geometry {
 
     private fun corners(e: DxfEntity, order: IntArray): List<DoubleArray> {
         val all = (0..3).map { e.point(10 + it, 20 + it) }
-        return order.mapNotNull { all[it] }
+        return order.map { all[it] }.filterNotNull()
     }
 
     private fun arcPoints(cx: Double, cy: Double, r: Double, a0: Double, a1: Double): List<DoubleArray> {
