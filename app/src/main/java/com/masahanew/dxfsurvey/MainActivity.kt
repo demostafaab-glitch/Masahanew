@@ -13,8 +13,19 @@ import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.TableLayout
+import android.widget.TableRow
 import android.widget.TextView
 import android.widget.Toast
+
+/** A point listed in the survey table. Angle and distance are null for points made from coordinates only. */
+private data class SurveyPoint(
+    val name: String,
+    val e: Double,
+    val n: Double,
+    val angleGon: Double?,
+    val distance: Double?
+)
 
 class MainActivity : Activity() {
 
@@ -24,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var stakeGroup: LinearLayout
     private lateinit var detailGroup: LinearLayout
     private lateinit var resultView: TextView
+    private lateinit var pointsTable: TableLayout
     private lateinit var angleField: EditText
     private lateinit var distField: EditText
     private lateinit var stakeStation: PointRow
@@ -33,6 +45,8 @@ class MainActivity : Activity() {
     private lateinit var detailZero: PointRow
 
     private val snapButtons = LinkedHashMap<SnapMode, Button>()
+    private val surveyPoints = mutableListOf<SurveyPoint>()
+    private var pointNumber = 1
     private var model: DxfModel? = null
 
     private val reqOpen = 1
@@ -69,11 +83,12 @@ class MainActivity : Activity() {
         button("نص") { editText() }
         button("إحداثيات") { editCoords() }
         button("مساحة") { toggleSurveyPanel() }
+        button("إيقاف الالتقاط") { stopPicking() }
         button("حفظ كنسخة") { saveCopy() }
         button("+") { dxfView.zoomBy(1.25f) }
         button("-") { dxfView.zoomBy(0.8f) }
 
-        // Snap type row (used by picks)
+        // Snap type row
         val snapRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (mode in SnapMode.values()) {
             val b = Button(this)
@@ -83,12 +98,12 @@ class MainActivity : Activity() {
             snapButtons[mode] = b
         }
 
-        // Survey point rows
-        stakeStation = PointRow("محطة", Role.STATION)
-        stakeZero = PointRow("تصفير", Role.ZERO)
-        stakeTarget = PointRow("هدف", Role.TARGET)
-        detailStation = PointRow("محطة", Role.STATION)
-        detailZero = PointRow("تصفير", Role.ZERO)
+        // Survey rows
+        stakeStation = PointRow("المحطة", Role.STATION)
+        stakeZero = PointRow("التصفير", Role.ZERO)
+        stakeTarget = PointRow("الهدف", Role.TARGET)
+        detailStation = PointRow("المحطة", Role.STATION)
+        detailZero = PointRow("التصفير", Role.ZERO)
         angleField = numField("الزاوية الأفقية (غ)", null)
         distField = numField("المسافة (م)", null)
 
@@ -103,7 +118,14 @@ class MainActivity : Activity() {
             addView(stakeStation.row)
             addView(stakeZero.row)
             addView(stakeTarget.row)
-            addView(Button(this@MainActivity).apply { text = "احسب الزاوية والمسافة"; setOnClickListener { computeStake() } })
+            addView(Button(this@MainActivity).apply {
+                text = "ابدأ التوقيع (محطة ← تصفير ← أهداف)"
+                setOnClickListener { startStakeSequence() }
+            })
+            addView(Button(this@MainActivity).apply {
+                text = "إضافة الهدف المدخل يدوياً"
+                setOnClickListener { addManualTarget() }
+            })
         }
 
         detailGroup = LinearLayout(this).apply {
@@ -111,9 +133,31 @@ class MainActivity : Activity() {
             visibility = View.GONE
             addView(detailStation.row)
             addView(detailZero.row)
+            addView(Button(this@MainActivity).apply {
+                text = "التقاط المحطة والتصفير"
+                setOnClickListener { pickFor(detailStation) { pickFor(detailZero) } }
+            })
             addView(angleField)
             addView(distField)
-            addView(Button(this@MainActivity).apply { text = "احسب الإحداثيات"; setOnClickListener { computeDetail() } })
+            addView(Button(this@MainActivity).apply {
+                text = "احسب وأنشئ النقطة"
+                setOnClickListener { createDetailPoint() }
+            })
+        }
+
+        // Points table
+        pointsTable = TableLayout(this).apply {
+            addView(TableRow(this@MainActivity).apply {
+                addView(cell("الاسم"))
+                addView(cell("E"))
+                addView(cell("N"))
+                addView(cell("الزاوية (غ)"))
+                addView(cell("المسافة (م)"))
+            })
+        }
+        val clearButton = Button(this).apply {
+            text = "مسح الجدول"
+            setOnClickListener { clearTable() }
         }
 
         resultView = TextView(this).apply {
@@ -128,13 +172,15 @@ class MainActivity : Activity() {
             addView(stakeGroup)
             addView(detailGroup)
             addView(resultView)
+            addView(pointsTable)
+            addView(clearButton)
         }
         surveyPanel = ScrollView(this).apply {
             addView(panelContent)
             visibility = View.GONE
         }
 
-        val panelHeight = (320 * resources.displayMetrics.density).toInt()
+        val panelHeight = (360 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(HorizontalScrollView(this@MainActivity).apply { addView(bar) })
@@ -169,17 +215,48 @@ class MainActivity : Activity() {
         resultView.text = ""
     }
 
-    /** Starts a pick: the next tap on the chosen snap type fills this row. */
-    private fun pickFor(row: PointRow) {
-        dxfView.startPick { x, y ->
-            row.fill(Survey.Pt(x, y))
-            dxfView.setMarker(row.role, x, y)
-            status.text = "تم الالتقاط: E=${f4(x)}  N=${f4(y)}"
-        }
-        status.text = "اضغط على الشاشة لالتقاط نقطة (${snapLabel(dxfView.snapMode)})"
+    private fun stopPicking() {
+        dxfView.cancelPick()
+        status.text = "تم إيقاف الالتقاط"
     }
 
-    private fun computeStake() {
+    /**
+     * Picks a point of [row] with the current snap type. When it is picked, [onDone] runs
+     * (used to chain station → zero → target automatically).
+     */
+    private fun pickFor(row: PointRow, onDone: (Survey.Pt) -> Unit = {}) {
+        dxfView.startPick { x, y ->
+            val p = Survey.Pt(x, y)
+            row.fill(p)
+            dxfView.setMarker(row.role, x, y)
+            status.text = "تم التقاط ${row.label}: E=${f3(x)}  N=${f3(y)}"
+            onDone(p)
+        }
+        status.text = "اضغط على الشاشة لالتقاط ${row.label} (${snapLabel(dxfView.snapMode)})"
+    }
+
+    /** Station, then zero, then targets continuously until "إيقاف الالتقاط". */
+    private fun startStakeSequence() {
+        pickFor(stakeStation) {
+            pickFor(stakeZero) {
+                pickFor(stakeTarget, ::onTargetPicked)
+            }
+        }
+    }
+
+    private fun onTargetPicked(p: Survey.Pt) {
+        val st = stakeStation.value()
+        val z = stakeZero.value()
+        if (st != null && z != null) {
+            val r = Survey.compute(st, z, p)
+            addSurveyPoint(SurveyPoint(nextName(), p.e, p.n, r.horizontalGon, r.distance))
+        } else {
+            toast("حدّد المحطة والتصفير أولاً")
+        }
+        pickFor(stakeTarget, ::onTargetPicked)
+    }
+
+    private fun addManualTarget() {
         val st = stakeStation.value()
         val z = stakeZero.value()
         val t = stakeTarget.value()
@@ -188,12 +265,12 @@ class MainActivity : Activity() {
             return
         }
         val r = Survey.compute(st, z, t)
-        resultView.text = "التوقيع:\n" +
-            "الزاوية الأفقية من التصفير مع عقارب الساعة: ${f4(r.horizontalGon)} غ\n" +
-            "المسافة من المحطة إلى الهدف: ${f3(r.distance)} م"
+        addSurveyPoint(SurveyPoint(nextName(), t.e, t.n, r.horizontalGon, r.distance))
+        dxfView.setMarker(Role.TARGET, t.e, t.n)
     }
 
-    private fun computeDetail() {
+    /** Detail survey: computes the point, draws it in the file, and lists it. */
+    private fun createDetailPoint() {
         val st = detailStation.value()
         val z = detailZero.value()
         val ang = parseNum(angleField)
@@ -203,8 +280,65 @@ class MainActivity : Activity() {
             return
         }
         val p = Survey.pointFromAngleDistance(st, z, ang, d)
-        resultView.text = "المسح التفصيلي:\nE = ${f4(p.e)}\nN = ${f4(p.n)}"
+        val name = nextName()
+
+        val m = model
+        if (m != null) {
+            m.snapshot()
+            m.entities.add(pointEntity(p))
+            m.entities.add(labelEntity(p, name))
+            dxfView.refreshAll()
+        } else {
+            toast("افتح ملف DXF لرسم النقطة")
+        }
+
+        addSurveyPoint(SurveyPoint(name, p.e, p.n, ang, d))
+        resultView.text = "تم إنشاء $name\nE = ${f4(p.e)}\nN = ${f4(p.n)}"
     }
+
+    private fun nextName(): String = "P${pointNumber++}"
+
+    private fun addSurveyPoint(sp: SurveyPoint) {
+        surveyPoints.add(sp)
+        pointsTable.addView(TableRow(this).apply {
+            addView(cell(sp.name))
+            addView(cell(f3(sp.e)))
+            addView(cell(f3(sp.n)))
+            addView(cell(sp.angleGon?.let { f4(it) } ?: "-"))
+            addView(cell(sp.distance?.let { f3(it) } ?: "-"))
+        })
+    }
+
+    private fun clearTable() {
+        while (pointsTable.childCount > 1) pointsTable.removeViewAt(1)
+        surveyPoints.clear()
+    }
+
+    private fun cell(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setPadding(12, 8, 12, 8)
+    }
+
+    private fun pointEntity(p: Survey.Pt): DxfEntity = DxfEntity(
+        mutableListOf(
+            DxfPair(0, "POINT"),
+            DxfPair(8, "0"),
+            DxfPair(10, DxfEntity.fmt(p.e)),
+            DxfPair(20, DxfEntity.fmt(p.n))
+        )
+    )
+
+    private fun labelEntity(p: Survey.Pt, name: String): DxfEntity = DxfEntity(
+        mutableListOf(
+            DxfPair(0, "TEXT"),
+            DxfPair(8, "0"),
+            DxfPair(10, DxfEntity.fmt(p.e)),
+            DxfPair(20, DxfEntity.fmt(p.n)),
+            DxfPair(40, "2.0"),
+            DxfPair(1, name)
+        )
+    )
 
     private fun openFile() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
@@ -350,7 +484,7 @@ class MainActivity : Activity() {
     }
 
     /** One point: East and North fields, plus a button to pick it from the drawing. */
-    private inner class PointRow(label: String, val role: Role) {
+    private inner class PointRow(val label: String, val role: Role) {
         private val east = numField("$label E", null)
         private val north = numField("$label N", null)
 
