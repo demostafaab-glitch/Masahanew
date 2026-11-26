@@ -17,6 +17,11 @@ import kotlin.math.min
 /** Which part of an entity a pick may snap to. */
 enum class SnapMode { START, MIDDLE, END, POINT }
 
+/** Role of a marked point on the drawing. */
+enum class Role(val label: String) { STATION("المحطة"), ZERO("التصفير"), TARGET("الهدف") }
+
+data class Marker(val role: Role, val x: Double, val y: Double)
+
 /**
  * Draws every entity. Pinch to zoom, one finger to pan.
  * Tap an entity to select it, then drag it to move it.
@@ -82,6 +87,20 @@ class DxfView(context: Context) : View(context) {
     }
     private val path = Path()
 
+    private val markers = mutableListOf<Marker>()
+    private val stationPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(229, 57, 53); style = Paint.Style.FILL
+    }
+    private val zeroPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(30, 100, 230); style = Paint.Style.FILL
+    }
+    private val targetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.rgb(0, 150, 60); style = Paint.Style.FILL
+    }
+    private val markerTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK; textSize = 30f
+    }
+
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -91,6 +110,38 @@ class DxfView(context: Context) : View(context) {
             }
         }
     )
+
+    /** Puts (or moves) the marker of a role. Each role has one marker. */
+    fun setMarker(role: Role, x: Double, y: Double) {
+        markers.removeAll { it.role == role }
+        markers.add(Marker(role, x, y))
+        invalidate()
+    }
+
+    fun clearMarkers() {
+        markers.clear()
+        invalidate()
+    }
+
+    private fun drawMarkers(canvas: Canvas) {
+        for (mk in markers) {
+            val x = sx(mk.x)
+            val y = sy(mk.y)
+            when (mk.role) {
+                Role.STATION -> {
+                    path.reset()
+                    path.moveTo(x, y - 14f)
+                    path.lineTo(x - 12f, y + 10f)
+                    path.lineTo(x + 12f, y + 10f)
+                    path.close()
+                    canvas.drawPath(path, stationPaint)
+                }
+                Role.ZERO -> canvas.drawRect(x - 9f, y - 9f, x + 9f, y + 9f, zeroPaint)
+                Role.TARGET -> canvas.drawCircle(x, y, 10f, targetPaint)
+            }
+            canvas.drawText(mk.role.label, x + 16f, y - 12f, markerTextPaint)
+        }
+    }
 
     val isPicking: Boolean
         get() = pickCallback != null
@@ -219,6 +270,7 @@ class DxfView(context: Context) : View(context) {
                 }
             }
         }
+        drawMarkers(canvas)
         hoverSnap?.let { h ->
             val x = sx(h[0])
             val y = sy(h[1])
